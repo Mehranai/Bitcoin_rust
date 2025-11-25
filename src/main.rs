@@ -73,10 +73,64 @@ async fn get_block_hash_by_height(height: u64) -> Result<String> {
     Ok(reqwest::get(url).await?.text().await?.trim().to_string())
 }
 
+// ----------> Main Code 
+// async fn get_block_txs(block_hash: &str) -> Result<Vec<BlockTx>> { let url = format!("{}/block/{}/txs", BASE_URL, block_hash); let resp = reqwest::get(&url).await?.json::<Vec<BlockTx>>().await?; Ok(resp) }
+
+// ----------> ChatGPT modified this one
 async fn get_block_txs(block_hash: &str) -> Result<Vec<BlockTx>> {
-    let url = format!("{}/block/{}/txs", BASE_URL, block_hash);
-    Ok(reqwest::get(url).await?.json::<Vec<BlockTx>>().await?)
+    let mut all_txs = Vec::new();
+    let mut start = 0;
+
+    loop {
+        let url = format!("{}/block/{}/txs/{}", BASE_URL, block_hash, start);
+
+        let resp = match reqwest::get(&url).await {
+            Ok(r) => r,
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                continue; // retry ساده
+            }
+        };
+
+        if !resp.status().is_success() {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue; // retry در صورت خطای موقتی
+        }
+
+        let body_text = resp.text().await?;
+        if body_text.trim().is_empty() {
+            break; // پایان تراکنش‌ها
+        }
+
+        let txs_page: Vec<BlockTx> = match serde_json::from_str(&body_text) {
+            Ok(page) => page,
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                continue; // retry در صورت JSON نامعتبر
+            }
+        };
+
+        if txs_page.is_empty() {
+            break;
+        }
+
+        let page_len = txs_page.len();
+        all_txs.extend(txs_page.into_iter());
+
+        if page_len < 25 {
+            break; // صفحه آخر
+        }
+
+        start += 25;
+
+        // فشار روی API کمتر شود
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    Ok(all_txs)
 }
+// ----------> ChatGPT modified this one
+
 
 fn btc_from_sats(sats: u64) -> f64 {
     sats as f64 / 100_000_000.0
@@ -105,7 +159,7 @@ async fn main() -> Result<()> {
     );
 
     let start_block: u64 = 831000;
-    let total_txs = 200;
+    let total_txs = 500;
     let mut tx_count = 0;
 
     for block_height in start_block..start_block + 10 {
