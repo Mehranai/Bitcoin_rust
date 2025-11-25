@@ -1,7 +1,7 @@
 // for running Codes :
 // clickhouse-client --user=mehran --password='mehran.crypto9' --multiquery < init_database.sql
 
-//drop database: DROP DATABASE IF EXISTS pajohesh;
+//drop database: DROP DATABASE IF EXISTS pajohesh_btc;
 
 use clickhouse::{Client, Row};
 use serde::{Serialize, Deserialize};
@@ -12,15 +12,28 @@ use futures::stream::{FuturesUnordered, StreamExt};
 
 static BASE_URL: &str = "https://blockstream.info/api";
 
-// ---------------------------------------------
 // DB Structs
-// ---------------------------------------------
+// -----------------------------------------------------
 
 #[derive(Row, Serialize, Deserialize)]
 struct WalletRow {
     address: String,
-    balance: f64,
+    balance: String,
+    nonce: u64,
     last_seen_block: u64,
+    #[serde(rename = "type")]
+    wallet_type: String,
+    defi: String,
+    sensitive: u8,
+}
+
+#[derive(Row, Serialize, Deserialize)]
+struct TransactionRow {
+    hash: String,
+    block_number: u64,
+    from_addr: String,
+    to_addr: String,
+    value: String,
 }
 
 #[derive(Row, Serialize, Deserialize)]
@@ -31,18 +44,8 @@ struct OwnerRow {
     personal_id: u16,
 }
 
-#[derive(Row, Serialize, Deserialize)]
-struct TransactionRow {
-    txid: String,
-    block_number: u64,
-    vin_addresses: Vec<String>,
-    vout_addresses: Vec<String>,
-    value: f64,
-}
-
-// ---------------------------------------------
-// API Structs
-// ---------------------------------------------
+// Blockstream API Structs
+// -----------------------------------------------------
 
 #[derive(Deserialize)]
 struct BlockTx {
@@ -62,21 +65,17 @@ struct Vout {
     value: u64,
 }
 
-// ---------------------------------------------
-// API Functions (Blockstream)
-// ---------------------------------------------
-
+// API Helper Functions
+// -----------------------------------------------------
 
 async fn get_block_hash_by_height(height: u64) -> Result<String> {
     let url = format!("{}/block-height/{}", BASE_URL, height);
-    let resp = reqwest::get(&url).await?.text().await?;
-    Ok(resp.trim().to_string())
+    Ok(reqwest::get(url).await?.text().await?.trim().to_string())
 }
 
 async fn get_block_txs(block_hash: &str) -> Result<Vec<BlockTx>> {
     let url = format!("{}/block/{}/txs", BASE_URL, block_hash);
-    let resp = reqwest::get(&url).await?.json::<Vec<BlockTx>>().await?;
-    Ok(resp)
+    Ok(reqwest::get(url).await?.json::<Vec<BlockTx>>().await?)
 }
 
 fn btc_from_sats(sats: u64) -> f64 {
@@ -84,22 +83,16 @@ fn btc_from_sats(sats: u64) -> f64 {
 }
 
 #[derive(Deserialize)]
-struct UTXO {
-    value: u64,
-}
+struct UTXO { value: u64 }
 
-// Get wallet balance (Using UTx0)
 async fn get_wallet_balance(address: &str) -> Result<f64> {
     let url = format!("{}/address/{}/utxo", BASE_URL, address);
-    let list = reqwest::get(&url).await?.json::<Vec<UTXO>>().await?;
-
-    let total_sats: u64 = list.iter().map(|u| u.value).sum();
-    Ok(btc_from_sats(total_sats))
+    let utxos = reqwest::get(url).await?.json::<Vec<UTXO>>().await?;
+    Ok(btc_from_sats(utxos.iter().map(|u| u.value).sum()))
 }
 
-// ---------------------------------------------
-// Main Logic
-// ---------------------------------------------
+// MAIN
+// -----------------------------------------------------
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -108,10 +101,10 @@ async fn main() -> Result<()> {
             .with_url("http://localhost:8123")
             .with_user("mehran")
             .with_password("mehran.crypto9")
-            .with_database("pajohesh"),
+            .with_database("pajohesh_btc")
     );
 
-    let start_block: u64 = 830_000;
+    let start_block: u64 = 831000;
     let total_txs = 200;
     let mut tx_count = 0;
 
@@ -132,7 +125,7 @@ async fn main() -> Result<()> {
             }));
 
             tx_count += 1;
-            println!("Tx #{}", tx_count);
+            println!("Tx: {}", tx_count);
         }
 
         while let Some(res) = tasks.next().await {
@@ -140,13 +133,13 @@ async fn main() -> Result<()> {
         }
     }
 
-    println!("Done: {} Bitcoin transactions fetched", tx_count);
+    println!("Done: {} BTC txs fetched", tx_count);
     Ok(())
 }
 
-// ---------------------------------------------
+
 // Process Transaction
-// ---------------------------------------------
+// -----------------------------------------------------
 
 async fn process_tx(
     clickhouse: &Arc<Client>,
@@ -154,40 +147,45 @@ async fn process_tx(
     tx: BlockTx,
 ) -> Result<()> {
 
-    let vin_addrs: Vec<String> = tx.vin.iter()
-        .filter_map(|v| v.prevout.as_ref())
-        .filter_map(|p| p.scriptpubkey_address.clone())
-        .collect();
+    // "Fake" from/to for BTC because DB requires them:
+    let from_addr = tx.vin
+        .iter()
+        .filter_map(|v| v.prevout.as_ref()?.scriptpubkey_address.clone())
+        .next()
+        .unwrap_or_default();
 
-    let vout_addrs: Vec<String> = tx.vout.iter()
+    let to_addr = tx.vout
+        .iter()
         .filter_map(|v| v.scriptpubkey_address.clone())
-        .collect();
+        .next()
+        .unwrap_or_default();
 
     let total_value_sats: u64 = tx.vout.iter().map(|v| v.value).sum();
 
-    let row = TransactionRow {
-        txid: tx.txid.clone(),
+    let tx_row = TransactionRow {
+        hash: tx.txid.clone(),
         block_number,
-        vin_addresses: vin_addrs.clone(),
-        vout_addresses: vout_addrs.clone(),
-        value: btc_from_sats(total_value_sats),
+        from_addr: from_addr.clone(),
+        to_addr: to_addr.clone(),
+        value: btc_from_sats(total_value_sats).to_string(),
     };
 
-    let mut insert = clickhouse.insert::<TransactionRow>("btc_transactions").await?;
-    insert.write(&row).await?;
-    insert.end().await?;
+    let mut insert_tx = clickhouse.insert::<TransactionRow>("transactions").await?;
+    insert_tx.write(&tx_row).await?;
+    insert_tx.end().await?;
 
-    // Save wallets (vin + vout)
-    for addr in vin_addrs.into_iter().chain(vout_addrs.into_iter()) {
-        save_wallet_clickhouse(clickhouse, &addr, block_number).await?;
+    if !from_addr.is_empty() {
+        save_wallet_clickhouse(clickhouse, &from_addr, block_number).await?;
+    }
+    if !to_addr.is_empty() {
+        save_wallet_clickhouse(clickhouse, &to_addr, block_number).await?;
     }
 
     Ok(())
 }
 
-// ---------------------------------------------
-// Save Wallet + Owner (like Ethereum version)
-// ---------------------------------------------
+// Save wallet + owner_info
+// -----------------------------------------------------
 
 async fn save_wallet_clickhouse(
     clickhouse: &Arc<Client>,
@@ -197,21 +195,25 @@ async fn save_wallet_clickhouse(
 
     let balance = get_wallet_balance(address).await?;
 
-    let row = WalletRow {
+    let wallet_row = WalletRow {
         address: address.clone(),
-        balance,
+        balance: balance.to_string(),
+        nonce: 0,                       // BTC: no nonce
         last_seen_block: block_number,
+        wallet_type: "wallet".into(),
+        defi: "".into(),
+        sensitive: 0,
     };
 
     let owner = OwnerRow {
         address: address.clone(),
-        person_name: "".to_string(),
+        person_name: "".into(),
         person_id: 0,
         personal_id: 0,
     };
 
     let mut insert_wallet = clickhouse.insert::<WalletRow>("wallet_info").await?;
-    insert_wallet.write(&row).await?;
+    insert_wallet.write(&wallet_row).await?;
     insert_wallet.end().await?;
 
     let mut insert_owner = clickhouse.insert::<OwnerRow>("owner_info").await?;
