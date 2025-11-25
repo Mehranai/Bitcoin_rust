@@ -147,7 +147,6 @@ async fn process_tx(
     tx: BlockTx,
 ) -> Result<()> {
 
-    // "Fake" from/to for BTC because DB requires them:
     let from_addr = tx.vin
         .iter()
         .filter_map(|v| v.prevout.as_ref()?.scriptpubkey_address.clone())
